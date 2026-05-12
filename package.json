@@ -1,0 +1,68 @@
+{
+  "name": "@mesh0/sdk",
+  "version": "0.1.0",
+  "description": "Official JavaScript/TypeScript client for the mesh0 telemetry platform — send events, query with TQL, tail with SSE/WebSocket.",
+  "license": "MIT",
+  "author": "mesh0",
+  "homepage": "https://mesh0.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mesh0-ai/js-sdk.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mesh0",
+    "telemetry",
+    "observability",
+    "tracing",
+    "logging",
+    "events",
+    "tql",
+    "otlp",
+    "sse",
+    "websocket"
+  ],
+  "peerDependencies": {
+    "ws": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0",
+    "ws": "^8.18.0"
+  }
+}
