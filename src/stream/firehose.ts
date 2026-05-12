@@ -3,8 +3,9 @@ import { ConfigurationError, NetworkError } from "../errors.js";
 import type { EventRow, FirehoseMessage } from "../types.js";
 
 export interface FirehoseOpts {
-  /** Either 'earliest', 'latest' (default), or a numeric offset string. */
-  since?: "earliest" | "latest" | string;
+  /** 'earliest', 'latest', or a numeric offset string. Server default is
+   *  'latest' when omitted. */
+  since?: "earliest" | "latest" | (string & {});
 }
 
 export interface FirehoseCallbacks {
@@ -138,7 +139,11 @@ export function openFirehose(
     callbacks.onError?.(toNetworkError(ev));
   });
   sock.addEventListener("close", (ev: unknown) => {
-    const code = ev && typeof ev === "object" && "code" in ev ? Number((ev as { code: unknown }).code) || 1000 : 1000;
+    const rawCode =
+      ev && typeof ev === "object" && "code" in ev
+        ? Number((ev as { code: unknown }).code)
+        : NaN;
+    const code = Number.isFinite(rawCode) ? rawCode : 1000;
     const reason =
       ev && typeof ev === "object" && "reason" in ev
         ? String((ev as { reason: unknown }).reason ?? "")

@@ -175,7 +175,7 @@ friendly) or `Authorization: Bearer <key>` (Node).
 
 ```ts
 const fh = mesh0.firehose(
-  { since: "latest" }, // or "earliest" or a numeric offset
+  { since: "latest" }, // or "earliest" or a numeric offset; server default is "latest"
   {
     onHello: ({ topic, since }) => console.log({ topic, since }),
     onEvent: (row, { partition, offset }) => console.log(row),

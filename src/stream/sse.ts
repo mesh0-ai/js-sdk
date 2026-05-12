@@ -182,9 +182,11 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
       for (;;) {
         const { value, done: streamDone } = await reader.read();
         if (streamDone) break;
-        buf += decoder.decode(value, { stream: true });
-        let lastBreak = buf.lastIndexOf("\n\n");
-        if (lastBreak === -1) lastBreak = buf.replace(/\r\n/g, "\n").lastIndexOf("\n\n");
+        // Normalize CRLF up-front so boundary indices line up with the
+        // string we actually slice. The SSE spec mandates LF after
+        // normalization anyway.
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        const lastBreak = buf.lastIndexOf("\n\n");
         if (lastBreak === -1) continue;
         const complete = buf.slice(0, lastBreak + 2);
         buf = buf.slice(lastBreak + 2);
