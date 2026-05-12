@@ -146,65 +146,60 @@ const { spans } = await mesh0.events.trace(traceId);
 ## Real-time
 
 The firehose is a single org-wide endpoint at `GET /v1/firehose` with
-two transports — WebSocket (default) and SSE — selected by the request's
-`Upgrade` header. Both share the same auth, query params (`?since=`,
-`?root=`), and payload shape. The only observable difference is wire
-framing, so pick whichever your runtime supports.
-
-### WebSocket firehose
-
-Authenticated via the `Sec-WebSocket-Protocol: mesh0.token.<key>`
-subprotocol (browser-friendly) or `Authorization: Bearer <key>` (Node).
+two transports — WebSocket (default) and SSE — selected by
+`opts.transport`. Both share the same auth, query params (`?since=`,
+`?root=`), payload shape, and `FirehoseHandle` contract. Pick SSE for
+runtimes that can't open a WebSocket (some serverless platforms,
+proxies that strip `Upgrade`).
 
 ```ts
 const fh = mesh0.firehose(
   {
-    since: "latest", // or "earliest" or a numeric offset; default "latest"
-    root: false,     // when true, deliver only root-trace events
+    transport: "ws",   // "ws" (default) or "sse"
+    since: "latest",   // "earliest" | "latest" | numeric offset string; default "latest"
+    root: false,       // when true, deliver only root-trace events
   },
   {
     onHello: ({ topic, since, root }) => console.log({ topic, since, root }),
     onEvent: (row, { partition, offset }) => console.log(row),
-    onPing: () => {},
-    onClose: (code, reason) => console.log("closed", code, reason),
+    onPing: (ts) => {},
+    // Terminal frames — server's per-connection queue overflowed or an
+    // event failed to marshal. The stream ends right after; refetch
+    // from /v1/events to recover, then reopen.
+    onResync: ({ reason, dropped }) => console.warn("resync", reason, dropped),
+    // Transport errors AND malformed/unknown server frames. Always a
+    // NetworkError. `closed.kind` carries the same signal if you only
+    // care about lifecycle.
     onError: (err) => console.error(err),
+    // Catch-all in receive order. Malformed frames go to onError, not here.
+    onMessage: (frame) => {},
   },
 );
 
-// Later:
+// Close when you're done. close() never throws and is idempotent.
 fh.close();
-await fh.closed;
+// Always-resolving Promise — never rejects. Inspect `kind` to discriminate:
+//   "ok"        | server closed cleanly
+//   "aborted"   | caller invoked close()
+//   "resync"    | terminal resync frame; .resync is populated
+//   "error"     | terminal server error frame; .serverError is populated
+//   "transport" | network drop / non-2xx connect / abnormal WS close; .error is populated
+const info = await fh.closed;
+if (info.kind === "resync") {
+  // refetch from /v1/events, then re-open
+}
 ```
 
-### SSE firehose
-
-Same endpoint, no `Upgrade` header. Useful for `curl`, `EventSource`,
-Cloudflare Workers, and anywhere WebSocket upgrades get stripped by a
-proxy. Implemented with `fetch` + `ReadableStream` so it works in every
-runtime (including ones without `EventSource`, and without the browser
-EventSource limitation of not being able to set `Authorization`).
+### Switching to SSE
 
 ```ts
-const handle = mesh0.stream(
-  { since: "latest", root: false },
-  {
-    onHello: ({ topic, since, root }) => console.log("connected"),
-    onEvent: (row, { partition, offset }) => console.log("event", row),
-    onPing: (ts) => {},
-    // resync is terminal: the server's per-connection queue overflowed
-    // (slow client) or an event failed to marshal. The stream ends right
-    // after — refetch from /v1/events to recover, then reopen.
-    onResync: ({ reason, dropped }) => console.warn("resync", reason, dropped),
-    onError: (e) => console.error(e),
-  },
-);
-
-// Close when you're done:
-handle.close();
-// Or await its lifetime (resolves when the server ends the stream,
-// rejects on transport error, server error frame, or resync):
-await handle.done;
+const fh = mesh0.firehose({ transport: "sse", since: "latest" }, callbacks);
 ```
+
+The SSE transport is implemented with `fetch` + `ReadableStream` so it
+works in every runtime — including ones without `EventSource`, and
+without the browser `EventSource` limitation of not being able to set
+`Authorization`.
 
 On Node ≥ 22 the WebSocket transport uses the global `WebSocket`
 automatically. On Node < 22, install `ws` and pass it in:
