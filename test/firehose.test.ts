@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { Mesh0 } from "../src/index.js";
+import { describe, it, expect, vi } from "vitest";
+import { Mesh0, ConfigurationError, NetworkError } from "../src/index.js";
 import type { EventRow, FirehoseMessage } from "../src/types.js";
 
 const KEY = "m0_test_xxxxxxxxxxxxxxxxxxxxxxxx";
@@ -9,10 +9,13 @@ type Listener = (ev: unknown) => void;
 class FakeWS {
   static lastUrl = "";
   static lastProtocols: string | string[] | undefined;
+  static instances: FakeWS[] = [];
   listeners = new Map<string, Listener[]>();
+  closeCalls: { code?: number; reason?: string }[] = [];
   constructor(url: string, protocols?: string | string[]) {
     FakeWS.lastUrl = url;
     FakeWS.lastProtocols = protocols;
+    FakeWS.instances.push(this);
   }
   addEventListener(type: string, listener: Listener) {
     const arr = this.listeners.get(type) ?? [];
@@ -24,86 +27,86 @@ class FakeWS {
   }
   send() {}
   close(code = 1000, reason = "") {
+    this.closeCalls.push({ code, reason });
     this.emit("close", { code, reason });
   }
 }
 
+function newMesh(extra: { since?: "earliest" | "latest" | string } = {}) {
+  FakeWS.instances = [];
+  const m = new Mesh0({
+    apiKey: KEY,
+    fetch: (async () => new Response("{}")) as typeof fetch,
+    WebSocket: FakeWS as unknown as typeof WebSocket,
+  });
+  return { m, extra };
+}
+
 describe("WebSocket firehose", () => {
-  it("connects with token subprotocol, parses hello/event/ping", async () => {
+  it("connects with token subprotocol and rewrites http(s) to ws(s)", () => {
+    const { m } = newMesh();
+    m.firehose({ since: "latest" });
+    expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose?since=latest");
+    expect(FakeWS.lastProtocols).toEqual([`mesh0.token.${KEY}`]);
+  });
+
+  it("omits ?since when not supplied", () => {
+    const { m } = newMesh();
+    m.firehose();
+    expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose");
+  });
+
+  it("rewrites http://localhost baseUrl to ws://", () => {
+    FakeWS.instances = [];
     const m = new Mesh0({
       apiKey: KEY,
+      baseUrl: "http://localhost:8080",
       fetch: (async () => new Response("{}")) as typeof fetch,
       WebSocket: FakeWS as unknown as typeof WebSocket,
     });
-    const events: { row: EventRow; partition: number }[] = [];
-    const messages: FirehoseMessage[] = [];
-    let hello: { topic: string; since: string } | null = null;
-
-    const handle = m.firehose(
-      { since: "latest" },
-      {
-        onHello: (h) => {
-          hello = h;
-        },
-        onEvent: (row, meta) => events.push({ row, partition: meta.partition }),
-        onMessage: (m) => messages.push(m),
-      },
-    );
-
-    expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose?since=latest");
-    expect(FakeWS.lastProtocols).toEqual([`mesh0.token.${KEY}`]);
-
-    // Grab the constructed socket via the stored handle's closed-promise
-    // side-effects: we need direct access for the fake, so re-resolve from
-    // the static reference. The constructor stored the instance in the
-    // chain but we don't have it — so emit by reconstructing the listeners
-    // list via the prototype is awkward. Easier: keep a ref.
-    // We patch this by creating our own socket via FakeWS again is not
-    // viable — instead, since FakeWS is what got constructed, fetch the
-    // instance from a side-channel.
-
-    // Simpler: expose via a custom subclass that captures `this`.
-    // Re-route by capturing in static field.
-
-    // Force-close to settle the test.
-    // (Hello/event emission is handled in the dedicated subclass below.)
-    void hello;
-    void events;
-    void messages;
-    handle.close();
-    await handle.closed;
+    m.firehose({ since: "earliest" });
+    expect(FakeWS.lastUrl).toBe("ws://localhost:8080/v1/firehose?since=earliest");
   });
 
-  it("dispatches messages and resolves closed promise", async () => {
-    let instance: CapturingWS | null = null;
-    class CapturingWS extends FakeWS {
-      constructor(url: string, protocols?: string | string[]) {
-        super(url, protocols);
-        instance = this;
-      }
+  it("throws ConfigurationError when no WebSocket is available", () => {
+    // Node 22+ provides globalThis.WebSocket; simulate Node <22 by stubbing
+    // it to undefined for the duration of the test.
+    vi.stubGlobal("WebSocket", undefined);
+    try {
+      const m = new Mesh0({
+        apiKey: KEY,
+        fetch: (async () => new Response("{}")) as typeof fetch,
+      });
+      expect(() => m.firehose()).toThrow(ConfigurationError);
+    } finally {
+      vi.unstubAllGlobals();
     }
-    const m = new Mesh0({
-      apiKey: KEY,
-      fetch: (async () => new Response("{}")) as typeof fetch,
-      WebSocket: CapturingWS as unknown as typeof WebSocket,
-    });
+  });
 
+  it("dispatches hello/event/ping and resolves closed cleanly on 1000", async () => {
+    const { m } = newMesh();
     const rows: EventRow[] = [];
+    const messages: FirehoseMessage[] = [];
     let ping = 0;
+    let helloTopic = "";
     const handle = m.firehose(
       {},
       {
+        onHello: (h) => {
+          helloTopic = h.topic;
+        },
         onEvent: (r) => rows.push(r),
         onPing: (t) => {
           ping = t;
         },
+        onMessage: (msg) => messages.push(msg),
       },
     );
-
-    instance!.emit("message", {
+    const ws = FakeWS.instances[0]!;
+    ws.emit("message", {
       data: JSON.stringify({ type: "hello", topic: "events.org.r1", since: "latest" }),
     });
-    instance!.emit("message", {
+    ws.emit("message", {
       data: JSON.stringify({
         type: "event",
         partition: 0,
@@ -119,14 +122,53 @@ describe("WebSocket firehose", () => {
         },
       }),
     });
-    instance!.emit("message", { data: JSON.stringify({ type: "ping", ts: 123 }) });
+    ws.emit("message", { data: JSON.stringify({ type: "ping", ts: 123 }) });
 
+    expect(helloTopic).toBe("events.org.r1");
     expect(rows.map((r) => r.event_id)).toEqual(["e1"]);
     expect(ping).toBe(123);
+    expect(messages).toHaveLength(3);
 
-    handle.close(1001, "bye");
-    const { code, reason } = await handle.closed;
-    expect(code).toBe(1001);
-    expect(reason).toBe("bye");
+    handle.close();
+    const info = await handle.closed;
+    expect(info.code).toBe(1000);
+    expect(info.clean).toBe(true);
+  });
+
+  it("marks closed.clean=false after malformed JSON frame", async () => {
+    const { m } = newMesh();
+    const errors: NetworkError[] = [];
+    const handle = m.firehose({}, { onError: (e) => errors.push(e) });
+    const ws = FakeWS.instances[0]!;
+    ws.emit("message", { data: "not-json{" });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(NetworkError);
+    handle.close();
+    const info = await handle.closed;
+    expect(info.clean).toBe(false);
+  });
+
+  it("surfaces unknown message types via onError", async () => {
+    const { m } = newMesh();
+    const errors: NetworkError[] = [];
+    const handle = m.firehose({}, { onError: (e) => errors.push(e) });
+    const ws = FakeWS.instances[0]!;
+    ws.emit("message", { data: JSON.stringify({ type: "future_kind" }) });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toContain("future_kind");
+    handle.close();
+    await handle.closed;
+  });
+
+  it("surfaces socket-level errors via onError with cause", () => {
+    const { m } = newMesh();
+    const errors: NetworkError[] = [];
+    m.firehose({}, { onError: (e) => errors.push(e) });
+    const ws = FakeWS.instances[0]!;
+    const underlying = new Error("ECONNRESET");
+    ws.emit("error", { message: "socket hung up", error: underlying });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toBe("socket hung up");
+    expect(errors[0]!.cause).toBe(underlying);
   });
 });

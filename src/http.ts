@@ -40,6 +40,10 @@ function parseRetryAfter(h: string | null): number | undefined {
   return undefined;
 }
 
+function isAbortError(err: unknown): boolean {
+  return !!err && typeof err === "object" && (err as { name?: unknown }).name === "AbortError";
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
@@ -62,6 +66,10 @@ function backoff(attempt: number, baseMs: number): number {
   return Math.floor(Math.random() * exp);
 }
 
+// Minimum wait before honoring a server-supplied Retry-After. A buggy server
+// or skewed clock that returns 0/past-date would otherwise hot-loop us.
+const MIN_RETRY_AFTER_MS = 100;
+
 async function readBody(res: Response): Promise<{ raw: string; json: unknown }> {
   const raw = await res.text();
   if (!raw) return { raw: "", json: null };
@@ -78,7 +86,11 @@ function throwForStatus(res: Response, body: { raw: string; json: unknown }): ne
   const code = typeof j.error === "string" ? j.error : `http_${res.status}`;
   const reason = typeof j.reason === "string" ? `: ${j.reason}` : "";
   const detail = typeof j.detail === "string" ? ` — ${j.detail}` : "";
-  const message = `${res.status} ${code}${reason}${detail}`;
+  // If the body wasn't JSON, surface a snippet of it so the caller has
+  // something to debug instead of an opaque `http_500`.
+  const rawHint =
+    body.json === null && body.raw ? ` — ${body.raw.slice(0, 200)}` : "";
+  const message = `${res.status} ${code}${reason}${detail}${rawHint}`;
   const errorId = typeof j.errorId === "string" ? j.errorId : undefined;
 
   if (res.status === 401 || res.status === 403) {
@@ -102,11 +114,12 @@ function throwForStatus(res: Response, body: { raw: string; json: unknown }): ne
   if (res.status >= 400) {
     throw new BadRequestError(res.status, code, message, body.json);
   }
-  // Should not get here — non-2xx that doesn't match the buckets above.
+  // Fallback for status codes outside the standard 4xx/5xx buckets.
   throw new ApiError(res.status, code, message, body.json);
 }
 
-/** Idempotent statuses + network errors are retried. */
+/** HTTP statuses considered transient/retryable. Network failures are handled
+ *  separately in the request catch block. */
 function isRetryable(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
 }
@@ -133,7 +146,11 @@ export class HttpClient {
     let lastErr: unknown;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(new Error("mesh0: request timed out")), this.cfg.timeoutMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        ac.abort(new Error("mesh0: request timed out"));
+      }, this.cfg.timeoutMs);
       const onUserAbort = () => ac.abort(opts.signal?.reason);
       opts.signal?.addEventListener("abort", onUserAbort, { once: true });
 
@@ -148,8 +165,17 @@ export class HttpClient {
       } catch (err) {
         clearTimeout(timer);
         opts.signal?.removeEventListener("abort", onUserAbort);
+        // User cancellation must surface immediately — never wrap or retry.
+        if (opts.signal?.aborted) throw opts.signal.reason ?? err;
+        // Timeout: surface as NetworkError but do not retry — the request
+        // already exceeded the user's budget. Retrying compounds the wait.
+        if (timedOut) {
+          throw new NetworkError(`mesh0: ${opts.method} ${opts.path} timed out after ${this.cfg.timeoutMs}ms`, err);
+        }
+        // AbortError that isn't ours is a programming error — re-throw raw.
+        if (isAbortError(err)) throw err;
         lastErr = new NetworkError(`mesh0: network error during ${opts.method} ${opts.path}`, err);
-        if (attempt < maxAttempts - 1 && !opts.signal?.aborted) {
+        if (attempt < maxAttempts - 1) {
           await sleep(backoff(attempt, this.cfg.retryBaseMs), opts.signal);
           continue;
         }
@@ -162,14 +188,26 @@ export class HttpClient {
         if (res.status === 204) return undefined as T;
         const ct = res.headers.get("content-type") ?? "";
         if (ct.includes("application/json")) {
-          return (await res.json()) as T;
+          const raw = await res.text();
+          if (!raw) return undefined as T;
+          try {
+            return JSON.parse(raw) as T;
+          } catch (err) {
+            throw new NetworkError(
+              `mesh0: ${opts.method} ${opts.path} returned malformed JSON`,
+              err,
+            );
+          }
         }
         return (await res.text()) as unknown as T;
       }
 
       if (isRetryable(res.status) && attempt < maxAttempts - 1) {
         const ra = parseRetryAfter(res.headers.get("retry-after"));
-        const wait = ra !== undefined ? ra * 1000 : backoff(attempt, this.cfg.retryBaseMs);
+        const wait =
+          ra !== undefined
+            ? Math.max(ra * 1000, MIN_RETRY_AFTER_MS)
+            : backoff(attempt, this.cfg.retryBaseMs);
         await sleep(wait, opts.signal);
         continue;
       }
@@ -177,7 +215,8 @@ export class HttpClient {
       const body = await readBody(res);
       throwForStatus(res, body);
     }
-    // Exhausted retries on network failure.
+    // Unreachable: throwForStatus is `: never` and the catch block always
+    // throws on the final attempt. Kept as a defensive sink for typing.
     throw lastErr ?? new NetworkError("mesh0: request failed after retries");
   }
 

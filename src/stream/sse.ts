@@ -2,13 +2,27 @@
 // (browsers + Node 22+ have it, edge runtimes vary, and EventSource can't
 // set the Authorization header in browsers). Doing it ourselves with
 // fetch + ReadableStream keeps one code path everywhere.
+//
+// Note: this client does not auto-reconnect. Consumers wanting at-least-
+// once delivery across reconnects should track the latest event_id they
+// saw and re-call stream() after `done` resolves or rejects.
 
 import type { HttpClient } from "../http.js";
-import { NetworkError } from "../errors.js";
+import {
+  ApiError,
+  AuthenticationError,
+  BadRequestError,
+  Mesh0Error,
+  NetworkError,
+  NotFoundError,
+  RateLimitError,
+  ServerError,
+} from "../errors.js";
 import type { EventRow, StreamMessage } from "../types.js";
 
 export interface StreamHandle {
-  /** Resolves when the stream ends cleanly (server closes). */
+  /** Resolves when the stream ends cleanly (server closes or caller calls
+   *  `close()`). Rejects on transport error or a server-sent `error` frame. */
   done: Promise<void>;
   /** Close the underlying connection. */
   close(): void;
@@ -57,8 +71,20 @@ function parseSseData(event: string, data: string): StreamMessage | null {
       return { event: "hello", data: (parsed as Record<string, unknown>) ?? {} };
     }
     case "ping": {
-      const n = Number(data);
-      return { event: "ping", data: Number.isFinite(n) ? n : Date.now() };
+      // Server may send either a bare number or `{"ts": <number>}`. We
+      // accept both; the firehose ping uses the object form so this
+      // keeps consumers consistent across the two channels.
+      const trimmed = data.trim();
+      const asNum = Number(trimmed);
+      if (Number.isFinite(asNum)) return { event: "ping", data: asNum };
+      const parsed = safeJson(trimmed);
+      if (parsed && typeof parsed === "object") {
+        const ts = (parsed as { ts?: unknown }).ts;
+        if (typeof ts === "number" && Number.isFinite(ts)) {
+          return { event: "ping", data: ts };
+        }
+      }
+      return null;
     }
     case "event": {
       const parsed = safeJson(data);
@@ -91,6 +117,37 @@ function safeJson(s: string): unknown {
   }
 }
 
+function isAbortError(err: unknown): boolean {
+  return !!err && typeof err === "object" && (err as { name?: unknown }).name === "AbortError";
+}
+
+async function buildConnectError(res: Response): Promise<Mesh0Error> {
+  const raw = await res.text().catch(() => "");
+  let json: unknown = null;
+  if (raw) {
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      /* leave as raw string */
+    }
+  }
+  const j = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+  const code = typeof j.error === "string" ? j.error : `http_${res.status}`;
+  const reason = typeof j.reason === "string" ? `: ${j.reason}` : "";
+  const message = `mesh0: SSE connect failed — ${res.status} ${code}${reason}`;
+  const errorId = typeof j.errorId === "string" ? j.errorId : undefined;
+  if (res.status === 401 || res.status === 403)
+    return new AuthenticationError(res.status, code, message, json);
+  if (res.status === 404) return new NotFoundError(res.status, code, message, json);
+  if (res.status === 429)
+    return new RateLimitError(res.status, code, message, json);
+  if (res.status >= 500)
+    return new ServerError(res.status, code, message, json, errorId);
+  if (res.status >= 400)
+    return new BadRequestError(res.status, code, message, json);
+  return new ApiError(res.status, code, message, json);
+}
+
 /** Open the SSE channel at GET /v1/events/stream. */
 export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}): StreamHandle {
   const ac = new AbortController();
@@ -111,18 +168,16 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
         signal: ac.signal,
       });
     } catch (err) {
-      if (ac.signal.aborted) return;
+      if (isAbortError(err)) return;
       throw new NetworkError("mesh0: SSE connect failed", err);
     }
-    if (!res.ok) {
-      throw new NetworkError(`mesh0: SSE connect failed with status ${res.status}`);
-    }
-    if (!res.body) {
-      throw new NetworkError("mesh0: SSE response had no body");
-    }
+    if (!res.ok) throw await buildConnectError(res);
+    if (!res.body) throw new NetworkError("mesh0: SSE response had no body");
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
+    let serverError: { reason: string; errorId?: string } | null = null;
     try {
       for (;;) {
         const { value, done: streamDone } = await reader.read();
@@ -152,19 +207,27 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
               break;
             case "error":
               callbacks.onError?.(msg.data);
+              // Capture and reject `done` once the stream closes — a server
+              // `error` frame is a terminal condition, never recoverable.
+              serverError = msg.data;
               break;
           }
         }
       }
     } catch (err) {
-      if (ac.signal.aborted) return;
+      if (isAbortError(err)) return;
       throw err;
     } finally {
+      // Lock may already be released if the stream closed naturally.
       try {
         reader.releaseLock();
       } catch {
         /* ignore */
       }
+    }
+    if (serverError) {
+      const detail = serverError.errorId ? ` (errorId=${serverError.errorId})` : "";
+      throw new NetworkError(`mesh0: SSE server error — ${serverError.reason}${detail}`);
     }
   })();
 

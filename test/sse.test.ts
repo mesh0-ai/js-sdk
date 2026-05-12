@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Mesh0 } from "../src/index.js";
+import { Mesh0, AuthenticationError, NetworkError } from "../src/index.js";
 import type { EventRow } from "../src/types.js";
 
 const KEY = "m0_test_xxxxxxxxxxxxxxxxxxxxxxxx";
@@ -10,7 +10,6 @@ function sseStream(chunks: string[]): ReadableStream<Uint8Array> {
     async start(controller) {
       for (const c of chunks) {
         controller.enqueue(enc.encode(c));
-        await new Promise((r) => setTimeout(r, 1));
       }
       controller.close();
     },
@@ -61,5 +60,76 @@ describe("SSE stream", () => {
     const rows: EventRow[] = [];
     await m.stream({ onEvent: (r) => rows.push(r) }).done;
     expect(rows.map((r) => r.event_id)).toEqual(["e1"]);
+  });
+
+  it("accepts ping as {ts: n} as well as bare number", async () => {
+    const body = sseStream(['event: ping\ndata: {"ts":42}\n\n']);
+    const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    const pings: number[] = [];
+    await m.stream({ onPing: (t) => pings.push(t) }).done;
+    expect(pings).toEqual([42]);
+  });
+
+  it("surfaces resync via onResync callback", async () => {
+    const body = sseStream(["event: resync\ndata: {}\n\n"]);
+    const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    let resynced = false;
+    await m.stream({
+      onResync: () => {
+        resynced = true;
+      },
+    }).done;
+    expect(resynced).toBe(true);
+  });
+
+  it("rejects done when server sends an error frame", async () => {
+    const body = sseStream([
+      'event: error\ndata: {"reason":"project_disabled","errorId":"trace-9"}\n\n',
+    ]);
+    const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    const seen: { reason: string; errorId?: string }[] = [];
+    const err = await m
+      .stream({ onError: (e) => seen.push(e) })
+      .done.catch((e: unknown) => e);
+    expect(seen).toEqual([{ reason: "project_disabled", errorId: "trace-9" }]);
+    expect(err).toBeInstanceOf(NetworkError);
+    expect((err as Error).message).toContain("project_disabled");
+  });
+
+  it("maps non-2xx connect response to an ApiError subtype with body detail", async () => {
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ error: "unauthorized", reason: "bad_token" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    const err = await m.stream().done.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AuthenticationError);
+    expect((err as AuthenticationError).status).toBe(401);
+  });
+
+  it("close() resolves done cleanly mid-stream", async () => {
+    let cancelled = false;
+    const fetchFn = (async (_url: string, init?: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // When the SSE client aborts, end the body so reader.read()
+          // unblocks. Real fetch implementations do this automatically.
+          init?.signal?.addEventListener("abort", () => {
+            cancelled = true;
+            controller.close();
+          });
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    const handle = m.stream();
+    setTimeout(() => handle.close(), 5);
+    await expect(handle.done).resolves.toBeUndefined();
+    expect(cancelled).toBe(true);
   });
 });

@@ -1,5 +1,9 @@
-// Wire-format types mirroring backend/internal/ingest/types.go and
-// backend/internal/query/tql/wire.go. Keep these in sync with mesh0/core.
+// Wire-format types for the mesh0 public HTTP and stream APIs. Field
+// names are snake_case where the server returns snake_case (event rows,
+// trace spans) and camelCase where the server uses camelCase (config,
+// pagination, org/project). The shapes mirror the JSON contract — they
+// are not translated, so callers can pass server responses through
+// unchanged.
 
 /** One event as accepted by POST /v1/events. */
 export interface EventInput {
@@ -33,7 +37,7 @@ export interface EventRow {
 }
 
 export interface EventsListResponse {
-  events: Record<string, unknown>[];
+  events: EventRow[];
   nextCursor: string | null;
   hasMore: boolean;
 }
@@ -81,7 +85,6 @@ export interface QueryRequest {
 export interface QueryResponse {
   columns: string[];
   rows: unknown[][];
-  [extra: string]: unknown;
 }
 
 export interface MeResponse {
@@ -100,22 +103,21 @@ export interface OrgResponse {
   name: string;
   status: string;
   createdAt: string;
-  [extra: string]: unknown;
 }
 
 export interface ProjectResponse {
   id: string;
   name: string;
-  [extra: string]: unknown;
 }
 
-/** Server→client message on the WS /v1/firehose stream. */
+/** Server→client message on the WS /v1/firehose stream. Discriminated on `type`. */
 export type FirehoseMessage =
   | { type: "hello"; topic: string; since: string }
   | { type: "event"; partition: number; offset: string; row: EventRow }
   | { type: "ping"; ts: number };
 
-/** Server→client message on the SSE /v1/events/stream channel. */
+/** Server→client message on the SSE /v1/events/stream channel. Discriminated on
+ *  `event` to match the SSE wire format's `event:` field. */
 export type StreamMessage =
   | { event: "hello"; data: Record<string, unknown> }
   | { event: "ping"; data: number }

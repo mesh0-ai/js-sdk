@@ -4,9 +4,8 @@ import type {
   EventsListResponse,
   EventRow,
 } from "../types.js";
-import { BadRequestError } from "../errors.js";
+import { ValidationError } from "../errors.js";
 
-/** Hard cap mirrored from backend `MaxEventsPerRequest`. */
 export const MAX_EVENTS_PER_REQUEST = 5000;
 
 export interface EventsListOpts {
@@ -33,7 +32,7 @@ export class EventsResource {
    */
   async sendMany(events: EventInput[], opts: { signal?: AbortSignal } = {}): Promise<void> {
     if (!Array.isArray(events) || events.length === 0) {
-      throw new BadRequestError(0, "invalid_payload", "mesh0: events must be a non-empty array", null);
+      throw new ValidationError("mesh0: events must be a non-empty array", "events");
     }
     for (let i = 0; i < events.length; i += MAX_EVENTS_PER_REQUEST) {
       const chunk = events.slice(i, i + MAX_EVENTS_PER_REQUEST);
@@ -62,7 +61,7 @@ export class EventsResource {
   }
 
   /** Stream every event by transparently following cursors. */
-  async *iterate(opts: Omit<EventsListOpts, "cursor"> = {}): AsyncGenerator<Record<string, unknown>> {
+  async *iterate(opts: Omit<EventsListOpts, "cursor"> = {}): AsyncGenerator<EventRow> {
     let cursor: string | undefined;
     for (;;) {
       const page: EventsListResponse = await this.list({ ...opts, cursor });
@@ -74,6 +73,7 @@ export class EventsResource {
 
   /** Fetch one trace by id (GET /v1/traces/:traceId). */
   async trace(traceId: string, opts: { signal?: AbortSignal } = {}): Promise<{ spans: Record<string, unknown>[] }> {
+    if (!traceId) throw new ValidationError("mesh0: traceId is required", "traceId");
     return this.http.request<{ spans: Record<string, unknown>[] }>({
       method: "GET",
       path: `/v1/traces/${encodeURIComponent(traceId)}`,

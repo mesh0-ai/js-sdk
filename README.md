@@ -6,8 +6,9 @@ Official JavaScript / TypeScript client for the [mesh0](https://mesh0.ai)
 telemetry platform. Send events, query them with TQL, and tail the live
 firehose — from browsers, Node, edge runtimes, and React Native.
 
-- **Universal** — runs on Node 18+, Bun, Deno, browsers, and edge
-  runtimes (Cloudflare Workers, Vercel Edge). No Node-only built-ins.
+- **Universal** — HTTP works on Node 18+, Bun, Deno, browsers, and edge
+  runtimes (Cloudflare Workers, Vercel Edge). The WebSocket firehose
+  needs Node ≥ 22 (or the `ws` package on older Node).
 - **Zero required deps** — uses platform `fetch` and `WebSocket`. The
   optional `ws` peer dep covers Node < 22.
 - **Fully typed** — strict TypeScript with no `any` on the public surface.
@@ -88,7 +89,8 @@ await mesh0.events.send({
   data: { messages },
 });
 
-// Bulk — up to 5,000 events per HTTP call. Larger batches auto-split.
+// Bulk — batches larger than MAX_EVENTS_PER_REQUEST auto-split into
+// sequential POSTs (the server enforces the same cap).
 await mesh0.events.sendMany(events);
 ```
 
@@ -256,8 +258,12 @@ All errors extend `Mesh0Error`:
 | `NotFoundError`         | 404      | Resource doesn't exist.                    |
 | `RateLimitError`        | 429      | Inspect `.retryAfter` (seconds).           |
 | `ServerError`           | 5xx      | mesh0 internal error; `.errorId` set.      |
-| `NetworkError`          | —        | Transport-level failure.                   |
+| `NetworkError`          | —        | Transport-level failure or timeout.        |
+| `ValidationError`       | —        | Caller-side input rejected before request. |
 | `ConfigurationError`    | —        | Bad SDK config (missing key, no fetch, …). |
+
+Every error carries a `kind` literal (`"api.auth"`, `"network"`, etc.)
+for exhaustive `switch` without `instanceof` chains.
 
 The HTTP transport retries `5xx`, `429`, and network failures up to
 `maxRetries` with exponential backoff + jitter; `Retry-After` is honored.

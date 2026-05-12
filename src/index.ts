@@ -3,6 +3,7 @@ export type { Mesh0Config, Mesh0ConfigInput } from "./config.js";
 export {
   Mesh0Error,
   ConfigurationError,
+  ValidationError,
   NetworkError,
   ApiError,
   AuthenticationError,
@@ -39,4 +40,5 @@ export type {
   FirehoseOpts,
   FirehoseCallbacks,
   FirehoseHandle,
+  FirehoseCloseInfo,
 } from "./stream/firehose.js";

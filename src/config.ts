@@ -15,7 +15,9 @@ export interface Mesh0ConfigInput {
   defaultHeaders?: Record<string, string>;
   /** Custom fetch implementation. Defaults to globalThis.fetch. */
   fetch?: typeof fetch;
-  /** Custom WebSocket constructor. Defaults to globalThis.WebSocket. */
+  /** Custom WebSocket constructor. Defaults to globalThis.WebSocket. Only
+   *  required if you call {@link Mesh0.firehose}; HTTP works without it.
+   *  On Node <22 pass the `ws` package: `new Mesh0({ WebSocket: WebSocket })`. */
   WebSocket?: typeof WebSocket;
 }
 
@@ -58,7 +60,10 @@ export function resolveConfig(input: Mesh0ConfigInput = {}): Mesh0Config {
     /\/+$/,
     "",
   );
-  const fetchImpl = input.fetch ?? globalThis.fetch;
+  // Only bind globalThis when falling back to the global fetch — a
+  // user-supplied fetch may rely on its own `this`.
+  const userFetch = input.fetch;
+  const fetchImpl = userFetch ?? (globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined);
   if (!fetchImpl) {
     throw new ConfigurationError(
       "mesh0: no fetch implementation available — pass { fetch } or run on Node 18+/modern browser.",
@@ -72,7 +77,7 @@ export function resolveConfig(input: Mesh0ConfigInput = {}): Mesh0Config {
     retryBaseMs: input.retryBaseMs ?? 250,
     userAgent: input.userAgent ?? DEFAULT_UA,
     defaultHeaders: input.defaultHeaders ?? {},
-    fetch: fetchImpl.bind(globalThis),
+    fetch: fetchImpl,
     WebSocket: input.WebSocket ?? (globalThis as { WebSocket?: typeof WebSocket }).WebSocket,
   };
 }
