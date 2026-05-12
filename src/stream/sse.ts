@@ -1,11 +1,19 @@
-// fetch-based SSE parser. EventSource is not portable across runtimes
-// (browsers + Node 22+ have it, edge runtimes vary, and EventSource can't
-// set the Authorization header in browsers). Doing it ourselves with
+// fetch-based SSE parser for the SSE transport of the org-wide firehose
+// (GET /v1/firehose without an Upgrade header). EventSource is not portable
+// across runtimes (browsers + Node 22+ have it, edge runtimes vary, and
+// EventSource can't set Authorization in browsers). Doing it ourselves with
 // fetch + ReadableStream keeps one code path everywhere.
 //
-// Note: this client does not auto-reconnect. Consumers wanting at-least-
-// once delivery across reconnects should track the latest event_id they
-// saw and re-call stream() after `done` resolves or rejects.
+// The SSE transport is a sibling of the WebSocket firehose; both share the
+// same endpoint, auth, query params (?since=, ?root=), and event payload
+// shape. The only difference is the wire framing — SSE for callers that
+// can't or won't upgrade (curl, EventSource, some serverless runtimes,
+// proxies that strip Upgrade).
+//
+// Note: this client does not auto-reconnect. After a `resync` (server-side
+// queue overflow or marshal failure) or an `error` frame, the stream
+// terminates and consumers should re-call stream(). To recover the events
+// they missed, refetch from /v1/events.
 
 import type { HttpClient } from "../http.js";
 import {
@@ -18,21 +26,38 @@ import {
   RateLimitError,
   ServerError,
 } from "../errors.js";
-import type { EventRow, StreamMessage } from "../types.js";
+import type {
+  EventRow,
+  FirehoseHello,
+  FirehoseResync,
+  StreamMessage,
+} from "../types.js";
+
+export interface StreamOpts {
+  /** 'earliest', 'latest', or a numeric offset string. Server default is
+   *  'latest' when omitted. A numeric offset is silently downgraded to
+   *  'latest' on the org-wide firehose; the hello frame reflects the
+   *  effective start point. */
+  since?: "earliest" | "latest" | (string & {});
+  /** When true, request only root-trace events (rows with empty
+   *  parent_span_id). Server-side filter. */
+  root?: boolean;
+}
 
 export interface StreamHandle {
   /** Resolves when the stream ends cleanly (server closes or caller calls
-   *  `close()`). Rejects on transport error or a server-sent `error` frame. */
+   *  `close()`). Rejects on transport error, a server-sent `error` frame,
+   *  or a `resync` frame (terminal — refetch from /v1/events to recover). */
   done: Promise<void>;
   /** Close the underlying connection. */
   close(): void;
 }
 
 export interface StreamCallbacks {
-  onEvent?: (row: EventRow) => void;
-  onHello?: (data: Record<string, unknown>) => void;
+  onEvent?: (row: EventRow, meta: { partition: number; offset: string }) => void;
+  onHello?: (hello: FirehoseHello) => void;
   onPing?: (tsMs: number) => void;
-  onResync?: () => void;
+  onResync?: (info: FirehoseResync) => void;
   onError?: (err: { reason: string; errorId?: string }) => void;
   /** Catch-all: every server-sent message, in receive order. */
   onMessage?: (msg: StreamMessage) => void;
@@ -68,12 +93,17 @@ function parseSseData(event: string, data: string): StreamMessage | null {
   switch (event) {
     case "hello": {
       const parsed = data ? safeJson(data) : {};
-      return { event: "hello", data: (parsed as Record<string, unknown>) ?? {} };
+      const obj = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+      const hello: FirehoseHello = {
+        topic: typeof obj.topic === "string" ? obj.topic : "",
+        since: typeof obj.since === "string" ? obj.since : "",
+        root: Boolean(obj.root),
+      };
+      return { event: "hello", data: hello };
     }
     case "ping": {
       // Server may send either a bare number or `{"ts": <number>}`. We
-      // accept both; the firehose ping uses the object form so this
-      // keeps consumers consistent across the two channels.
+      // accept both for forward compatibility.
       const trimmed = data.trim();
       const asNum = Number(trimmed);
       if (Number.isFinite(asNum)) return { event: "ping", data: asNum };
@@ -89,10 +119,22 @@ function parseSseData(event: string, data: string): StreamMessage | null {
     case "event": {
       const parsed = safeJson(data);
       if (!parsed || typeof parsed !== "object") return null;
-      return { event: "event", data: parsed as EventRow };
+      const obj = parsed as { partition?: unknown; offset?: unknown; row?: unknown };
+      if (!obj.row || typeof obj.row !== "object") return null;
+      const partition = typeof obj.partition === "number" ? obj.partition : 0;
+      const offset = typeof obj.offset === "string" ? obj.offset : String(obj.offset ?? "");
+      return {
+        event: "event",
+        data: { partition, offset, row: obj.row as EventRow },
+      };
     }
-    case "resync":
-      return { event: "resync", data: {} };
+    case "resync": {
+      const parsed = safeJson(data);
+      const body = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+      const reason = typeof body.reason === "string" ? body.reason : "unknown";
+      const dropped = typeof body.dropped === "number" ? body.dropped : 0;
+      return { event: "resync", data: { reason, dropped } };
+    }
     case "error": {
       const parsed = safeJson(data);
       const body = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
@@ -148,10 +190,19 @@ async function buildConnectError(res: Response): Promise<Mesh0Error> {
   return new ApiError(res.status, code, message, json);
 }
 
-/** Open the SSE channel at GET /v1/events/stream. */
-export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}): StreamHandle {
+/** Open the SSE transport of the firehose at GET /v1/firehose. Org-wide
+ *  stream of every event across every project. To request the WS transport
+ *  of the same endpoint, use `Mesh0.firehose()` instead. */
+export function streamEvents(
+  http: HttpClient,
+  opts: StreamOpts = {},
+  callbacks: StreamCallbacks = {},
+): StreamHandle {
   const ac = new AbortController();
-  const url = http.buildUrl("/v1/events/stream");
+  const query: Record<string, string | number | boolean> = {};
+  if (opts.since) query.since = opts.since;
+  if (opts.root) query.root = 1;
+  const url = http.buildUrl("/v1/firehose", Object.keys(query).length ? query : undefined);
   const cfg = http.config;
 
   const done = (async () => {
@@ -178,6 +229,7 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     let serverError: { reason: string; errorId?: string } | null = null;
+    let resyncInfo: FirehoseResync | null = null;
     try {
       for (;;) {
         const { value, done: streamDone } = await reader.read();
@@ -202,10 +254,17 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
               callbacks.onPing?.(msg.data);
               break;
             case "event":
-              callbacks.onEvent?.(msg.data);
+              callbacks.onEvent?.(msg.data.row, {
+                partition: msg.data.partition,
+                offset: msg.data.offset,
+              });
               break;
             case "resync":
-              callbacks.onResync?.();
+              callbacks.onResync?.(msg.data);
+              // resync is terminal on the firehose: the server closes the
+              // stream right after. Capture and surface as a rejection so
+              // callers don't silently lose events.
+              resyncInfo = msg.data;
               break;
             case "error":
               callbacks.onError?.(msg.data);
@@ -230,6 +289,11 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
     if (serverError) {
       const detail = serverError.errorId ? ` (errorId=${serverError.errorId})` : "";
       throw new NetworkError(`mesh0: SSE server error — ${serverError.reason}${detail}`);
+    }
+    if (resyncInfo) {
+      throw new NetworkError(
+        `mesh0: SSE resync — ${resyncInfo.reason} (dropped=${resyncInfo.dropped})`,
+      );
     }
   })();
 

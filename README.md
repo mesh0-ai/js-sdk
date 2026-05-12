@@ -14,8 +14,9 @@ firehose — from browsers, Node, edge runtimes, and React Native.
 - **Fully typed** — strict TypeScript with no `any` on the public surface.
 - **Built-in retries** — idempotent failures (`5xx`, `429`, transport)
   retry with exponential backoff and `Retry-After` honored.
-- **Streaming** — fetch-based SSE parser for `/v1/events/stream` and a
-  WebSocket client for `/v1/firehose`.
+- **Streaming** — one org-wide firehose at `/v1/firehose`, with two
+  transports: WebSocket (default) or SSE (for runtimes that can't
+  upgrade). Same auth, same params, same payload either way.
 
 ---
 
@@ -144,40 +145,25 @@ const { spans } = await mesh0.events.trace(traceId);
 
 ## Real-time
 
-### SSE event stream — `/v1/events/stream`
+The firehose is a single org-wide endpoint at `GET /v1/firehose` with
+two transports — WebSocket (default) and SSE — selected by the request's
+`Upgrade` header. Both share the same auth, query params (`?since=`,
+`?root=`), and payload shape. The only observable difference is wire
+framing, so pick whichever your runtime supports.
 
-Scoped to the API key's project. Implemented with `fetch` +
-`ReadableStream` so it works in every runtime (including ones without
-`EventSource`, and without the browser EventSource limitation of not
-being able to set `Authorization`).
+### WebSocket firehose
 
-```ts
-const handle = mesh0.stream({
-  onHello: () => console.log("connected"),
-  onEvent: (row) => console.log("event", row),
-  onPing: (ts) => {},
-  // resync signals queue overflow on the server — refetch from /v1/events
-  onResync: () => {},
-  onError: (e) => console.error(e),
-});
-
-// Close when you're done:
-handle.close();
-// Or await its lifetime (resolves when the server ends the stream):
-await handle.done;
-```
-
-### WebSocket firehose — `/v1/firehose`
-
-Org-wide stream of every event across every project, authenticated via
-the `Sec-WebSocket-Protocol: mesh0.token.<key>` subprotocol (browser-
-friendly) or `Authorization: Bearer <key>` (Node).
+Authenticated via the `Sec-WebSocket-Protocol: mesh0.token.<key>`
+subprotocol (browser-friendly) or `Authorization: Bearer <key>` (Node).
 
 ```ts
 const fh = mesh0.firehose(
-  { since: "latest" }, // or "earliest" or a numeric offset; server default is "latest"
   {
-    onHello: ({ topic, since }) => console.log({ topic, since }),
+    since: "latest", // or "earliest" or a numeric offset; default "latest"
+    root: false,     // when true, deliver only root-trace events
+  },
+  {
+    onHello: ({ topic, since, root }) => console.log({ topic, since, root }),
     onEvent: (row, { partition, offset }) => console.log(row),
     onPing: () => {},
     onClose: (code, reason) => console.log("closed", code, reason),
@@ -190,8 +176,38 @@ fh.close();
 await fh.closed;
 ```
 
-On Node ≥ 22 the global `WebSocket` is used automatically. On Node < 22,
-install `ws` and pass it in:
+### SSE firehose
+
+Same endpoint, no `Upgrade` header. Useful for `curl`, `EventSource`,
+Cloudflare Workers, and anywhere WebSocket upgrades get stripped by a
+proxy. Implemented with `fetch` + `ReadableStream` so it works in every
+runtime (including ones without `EventSource`, and without the browser
+EventSource limitation of not being able to set `Authorization`).
+
+```ts
+const handle = mesh0.stream(
+  { since: "latest", root: false },
+  {
+    onHello: ({ topic, since, root }) => console.log("connected"),
+    onEvent: (row, { partition, offset }) => console.log("event", row),
+    onPing: (ts) => {},
+    // resync is terminal: the server's per-connection queue overflowed
+    // (slow client) or an event failed to marshal. The stream ends right
+    // after — refetch from /v1/events to recover, then reopen.
+    onResync: ({ reason, dropped }) => console.warn("resync", reason, dropped),
+    onError: (e) => console.error(e),
+  },
+);
+
+// Close when you're done:
+handle.close();
+// Or await its lifetime (resolves when the server ends the stream,
+// rejects on transport error, server error frame, or resync):
+await handle.done;
+```
+
+On Node ≥ 22 the WebSocket transport uses the global `WebSocket`
+automatically. On Node < 22, install `ws` and pass it in:
 
 ```ts
 import WebSocket from "ws";

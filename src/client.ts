@@ -7,6 +7,7 @@ import {
   streamEvents,
   type StreamCallbacks,
   type StreamHandle,
+  type StreamOpts,
 } from "./stream/sse.js";
 import {
   openFirehose,
@@ -34,12 +35,15 @@ export class Mesh0 {
     return new Mesh0({ apiKey });
   }
 
-  /** Subscribe to the SSE event stream scoped to the API key's project. */
-  stream(callbacks?: StreamCallbacks): StreamHandle {
-    return streamEvents(this.http, callbacks);
+  /** Open the SSE transport of the org-wide firehose at GET /v1/firehose.
+   *  Same payload and params as {@link Mesh0.firehose}, just transported as
+   *  SSE for callers that can't or won't open a WebSocket. */
+  stream(opts?: StreamOpts, callbacks?: StreamCallbacks): StreamHandle {
+    return streamEvents(this.http, opts, callbacks);
   }
 
-  /** Open the org-wide WebSocket firehose. */
+  /** Open the WebSocket transport of the org-wide firehose at GET
+   *  /v1/firehose (with `Upgrade: websocket`). */
   firehose(opts?: FirehoseOpts, callbacks?: FirehoseCallbacks): FirehoseHandle {
     return openFirehose(this.http, opts, callbacks);
   }

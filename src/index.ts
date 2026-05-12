@@ -25,7 +25,9 @@ export type {
   MeResponse,
   OrgResponse,
   ProjectResponse,
+  FirehoseHello,
   FirehoseMessage,
+  FirehoseResync,
   StreamMessage,
 } from "./types.js";
 export type {
@@ -35,6 +37,7 @@ export { MAX_EVENTS_PER_REQUEST } from "./resources/events.js";
 export type {
   StreamCallbacks,
   StreamHandle,
+  StreamOpts,
 } from "./stream/sse.js";
 export type {
   FirehoseOpts,

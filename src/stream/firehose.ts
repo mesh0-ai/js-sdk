@@ -1,15 +1,20 @@
 import type { HttpClient } from "../http.js";
 import { ConfigurationError, NetworkError } from "../errors.js";
-import type { EventRow, FirehoseMessage } from "../types.js";
+import type { EventRow, FirehoseHello, FirehoseMessage } from "../types.js";
 
 export interface FirehoseOpts {
   /** 'earliest', 'latest', or a numeric offset string. Server default is
-   *  'latest' when omitted. */
+   *  'latest' when omitted. A numeric offset on the org-wide firehose is
+   *  silently downgraded to 'latest' server-side (partitions have independent
+   *  offset spaces) — the hello frame reflects what the server actually used. */
   since?: "earliest" | "latest" | (string & {});
+  /** When true, request only root-trace events (rows with empty
+   *  parent_span_id). Server-side filter — non-root rows never cross the wire. */
+  root?: boolean;
 }
 
 export interface FirehoseCallbacks {
-  onHello?: (msg: { topic: string; since: string }) => void;
+  onHello?: (msg: FirehoseHello) => void;
   onEvent?: (row: EventRow, meta: { partition: number; offset: string }) => void;
   onPing?: (tsMs: number) => void;
   onMessage?: (msg: FirehoseMessage) => void;
@@ -68,8 +73,11 @@ export function openFirehose(
     );
   }
 
+  const query: Record<string, string | number | boolean> = {};
+  if (opts.since) query.since = opts.since;
+  if (opts.root) query.root = 1;
   const wsUrl = http
-    .buildUrl("/v1/firehose", opts.since ? { since: opts.since } : undefined)
+    .buildUrl("/v1/firehose", Object.keys(query).length ? query : undefined)
     .replace(/^http(s?):/, (_m, s: string) => `ws${s}:`);
 
   // Subprotocol token works for both browser and `ws` package — the server
@@ -117,7 +125,7 @@ export function openFirehose(
     callbacks.onMessage?.(msg);
     switch (msg.type) {
       case "hello":
-        callbacks.onHello?.({ topic: msg.topic, since: msg.since });
+        callbacks.onHello?.({ topic: msg.topic, since: msg.since, root: Boolean(msg.root) });
         break;
       case "event":
         callbacks.onEvent?.(msg.row, { partition: msg.partition, offset: msg.offset });

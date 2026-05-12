@@ -56,6 +56,18 @@ describe("WebSocket firehose", () => {
     expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose");
   });
 
+  it("threads ?root=1 when root-only is requested", () => {
+    const { m } = newMesh();
+    m.firehose({ root: true });
+    expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose?root=1");
+  });
+
+  it("combines since and root in the query string", () => {
+    const { m } = newMesh();
+    m.firehose({ since: "earliest", root: true });
+    expect(FakeWS.lastUrl).toBe("wss://api.mesh0.ai/v1/firehose?since=earliest&root=1");
+  });
+
   it("rewrites http://localhost baseUrl to ws://", () => {
     FakeWS.instances = [];
     const m = new Mesh0({
@@ -88,12 +100,12 @@ describe("WebSocket firehose", () => {
     const rows: EventRow[] = [];
     const messages: FirehoseMessage[] = [];
     let ping = 0;
-    let helloTopic = "";
+    let hello = { topic: "", since: "", root: false };
     const handle = m.firehose(
       {},
       {
         onHello: (h) => {
-          helloTopic = h.topic;
+          hello = h;
         },
         onEvent: (r) => rows.push(r),
         onPing: (t) => {
@@ -104,7 +116,7 @@ describe("WebSocket firehose", () => {
     );
     const ws = FakeWS.instances[0]!;
     ws.emit("message", {
-      data: JSON.stringify({ type: "hello", topic: "events.org.r1", since: "latest" }),
+      data: JSON.stringify({ type: "hello", topic: "events.org.r1", since: "latest", root: true }),
     });
     ws.emit("message", {
       data: JSON.stringify({
@@ -124,7 +136,7 @@ describe("WebSocket firehose", () => {
     });
     ws.emit("message", { data: JSON.stringify({ type: "ping", ts: 123 }) });
 
-    expect(helloTopic).toBe("events.org.r1");
+    expect(hello).toEqual({ topic: "events.org.r1", since: "latest", root: true });
     expect(rows.map((r) => r.event_id)).toEqual(["e1"]);
     expect(ping).toBe(123);
     expect(messages).toHaveLength(3);

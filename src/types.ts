@@ -110,17 +110,36 @@ export interface ProjectResponse {
   name: string;
 }
 
+/** Hello frame shared by both firehose transports. `since` is the
+ *  *effective* start point (a numeric offset without project scoping is
+ *  downgraded to `"latest"` server-side). */
+export interface FirehoseHello {
+  topic: string;
+  since: string;
+  root: boolean;
+}
+
 /** Server→client message on the WS /v1/firehose stream. Discriminated on `type`. */
 export type FirehoseMessage =
-  | { type: "hello"; topic: string; since: string }
+  | ({ type: "hello" } & FirehoseHello)
   | { type: "event"; partition: number; offset: string; row: EventRow }
   | { type: "ping"; ts: number };
 
-/** Server→client message on the SSE /v1/events/stream channel. Discriminated on
+/** Resync payload on the SSE firehose. The server emits this when its
+ *  per-connection queue overflowed (slow client) or when an event failed
+ *  to marshal; the SSE stream terminates after delivery. */
+export interface FirehoseResync {
+  reason: "overflow" | "marshal" | (string & {});
+  /** Best-effort count of events dropped before resync; `0` for non-overflow
+   *  reasons. */
+  dropped: number;
+}
+
+/** Server→client message on the SSE /v1/firehose channel. Discriminated on
  *  `event` to match the SSE wire format's `event:` field. */
 export type StreamMessage =
-  | { event: "hello"; data: Record<string, unknown> }
+  | { event: "hello"; data: FirehoseHello }
   | { event: "ping"; data: number }
-  | { event: "event"; data: EventRow }
-  | { event: "resync"; data: Record<string, unknown> }
+  | { event: "event"; data: { partition: number; offset: string; row: EventRow } }
+  | { event: "resync"; data: FirehoseResync }
   | { event: "error"; data: { reason: string; errorId?: string } };

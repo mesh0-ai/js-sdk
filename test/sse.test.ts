@@ -16,12 +16,53 @@ function sseStream(chunks: string[]): ReadableStream<Uint8Array> {
   });
 }
 
-describe("SSE stream", () => {
+const helloLine = (extra: Record<string, unknown> = {}) =>
+  `event: hello\ndata: ${JSON.stringify({ topic: "events.org.r1", since: "latest", root: false, ...extra })}\n\n`;
+
+const eventLine = (id: string, partition = 0, offset = "42"): string => {
+  const row = {
+    event_id: id,
+    trace_id: "t",
+    span_id: "s",
+    parent_span_id: "",
+    timestamp: "2026-01-01T00:00:00Z",
+    project_id: "p",
+    attributes: { k: "v" },
+  };
+  return `event: event\ndata: ${JSON.stringify({ partition, offset, row })}\n\n`;
+};
+
+describe("SSE firehose stream", () => {
+  it("hits /v1/firehose and threads since/root params", async () => {
+    let capturedUrl = "";
+    const fetchFn = (async (url: string) => {
+      capturedUrl = url;
+      return new Response(sseStream([helloLine()]), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    await m.stream({ since: "earliest", root: true }).done;
+    expect(capturedUrl).toBe("https://api.mesh0.ai/v1/firehose?since=earliest&root=1");
+  });
+
+  it("omits query when no opts are supplied", async () => {
+    let capturedUrl = "";
+    const fetchFn = (async (url: string) => {
+      capturedUrl = url;
+      return new Response(sseStream([helloLine()]), { status: 200 });
+    }) as typeof fetch;
+    const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
+    await m.stream().done;
+    expect(capturedUrl).toBe("https://api.mesh0.ai/v1/firehose");
+  });
+
   it("parses hello/event/ping records and surfaces them via callbacks", async () => {
     const body = sseStream([
-      "event: hello\ndata: {}\n\n",
+      helloLine({ root: true }),
       "event: ping\ndata: 1700000000000\n\n",
-      'event: event\ndata: {"event_id":"e1","trace_id":"t","span_id":"s","parent_span_id":"","timestamp":"2026-01-01T00:00:00Z","project_id":"p","attributes":{"k":"v"}}\n\n',
+      eventLine("e1", 3, "100"),
       "event: ping\ndata: 1700000001000\n\n",
     ]);
     const fetchFn = (async () =>
@@ -31,34 +72,34 @@ describe("SSE stream", () => {
       })) as typeof fetch;
     const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
 
-    const rows: EventRow[] = [];
+    const rows: { row: EventRow; partition: number; offset: string }[] = [];
     const pings: number[] = [];
-    let helloed = false;
-    const handle = m.stream({
-      onHello: () => {
-        helloed = true;
+    let hello = { topic: "", since: "", root: false };
+    const handle = m.stream(undefined, {
+      onHello: (h) => {
+        hello = h;
       },
       onPing: (t) => pings.push(t),
-      onEvent: (r) => rows.push(r),
+      onEvent: (row, meta) => rows.push({ row, partition: meta.partition, offset: meta.offset }),
     });
     await handle.done;
-    expect(helloed).toBe(true);
+    expect(hello).toEqual({ topic: "events.org.r1", since: "latest", root: true });
     expect(pings).toEqual([1_700_000_000_000, 1_700_000_001_000]);
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.event_id).toBe("e1");
-    expect(rows[0]!.attributes).toEqual({ k: "v" });
+    expect(rows[0]!.row.event_id).toBe("e1");
+    expect(rows[0]!.partition).toBe(3);
+    expect(rows[0]!.offset).toBe("100");
+    expect(rows[0]!.row.attributes).toEqual({ k: "v" });
   });
 
   it("handles records split across chunks", async () => {
-    const body = sseStream([
-      "event: event\ndata: ",
-      '{"event_id":"e1","trace_id":"t","span_id":"s","parent_span_id":"","timestamp":"x","project_id":"p","attributes":{}}',
-      "\n\n",
-    ]);
+    const eventFrame = eventLine("e1");
+    const half = eventFrame.length >> 1;
+    const body = sseStream([eventFrame.slice(0, half), eventFrame.slice(half)]);
     const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
     const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
     const rows: EventRow[] = [];
-    await m.stream({ onEvent: (r) => rows.push(r) }).done;
+    await m.stream(undefined, { onEvent: (r) => rows.push(r) }).done;
     expect(rows.map((r) => r.event_id)).toEqual(["e1"]);
   });
 
@@ -67,21 +108,24 @@ describe("SSE stream", () => {
     const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
     const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
     const pings: number[] = [];
-    await m.stream({ onPing: (t) => pings.push(t) }).done;
+    await m.stream(undefined, { onPing: (t) => pings.push(t) }).done;
     expect(pings).toEqual([42]);
   });
 
-  it("surfaces resync via onResync callback", async () => {
-    const body = sseStream(["event: resync\ndata: {}\n\n"]);
+  it("surfaces resync.reason/dropped and rejects done", async () => {
+    const body = sseStream([
+      'event: resync\ndata: {"reason":"overflow","dropped":17}\n\n',
+    ]);
     const fetchFn = (async () => new Response(body, { status: 200 })) as typeof fetch;
     const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
-    let resynced = false;
-    await m.stream({
-      onResync: () => {
-        resynced = true;
-      },
-    }).done;
-    expect(resynced).toBe(true);
+    const resyncs: { reason: string; dropped: number }[] = [];
+    const err = await m
+      .stream(undefined, { onResync: (info) => resyncs.push(info) })
+      .done.catch((e: unknown) => e);
+    expect(resyncs).toEqual([{ reason: "overflow", dropped: 17 }]);
+    expect(err).toBeInstanceOf(NetworkError);
+    expect((err as Error).message).toContain("overflow");
+    expect((err as Error).message).toContain("dropped=17");
   });
 
   it("rejects done when server sends an error frame", async () => {
@@ -92,7 +136,7 @@ describe("SSE stream", () => {
     const m = new Mesh0({ apiKey: KEY, fetch: fetchFn });
     const seen: { reason: string; errorId?: string }[] = [];
     const err = await m
-      .stream({ onError: (e) => seen.push(e) })
+      .stream(undefined, { onError: (e) => seen.push(e) })
       .done.catch((e: unknown) => e);
     expect(seen).toEqual([{ reason: "project_disabled", errorId: "trace-9" }]);
     expect(err).toBeInstanceOf(NetworkError);
