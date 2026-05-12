@@ -4,11 +4,6 @@ import { EventsResource } from "./resources/events.js";
 import { QueryResource } from "./resources/query.js";
 import { IdentityResource } from "./resources/identity.js";
 import {
-  streamEvents,
-  type StreamCallbacks,
-  type StreamHandle,
-} from "./stream/sse.js";
-import {
   openFirehose,
   type FirehoseCallbacks,
   type FirehoseHandle,
@@ -34,12 +29,9 @@ export class Mesh0 {
     return new Mesh0({ apiKey });
   }
 
-  /** Subscribe to the SSE event stream scoped to the API key's project. */
-  stream(callbacks?: StreamCallbacks): StreamHandle {
-    return streamEvents(this.http, callbacks);
-  }
-
-  /** Open the org-wide WebSocket firehose. */
+  /** Open the org-wide firehose at GET /v1/firehose. `opts.transport`
+   *  picks between `"ws"` (default) and `"sse"`; both share the same
+   *  auth, query params, payload shape, and handle contract. */
   firehose(opts?: FirehoseOpts, callbacks?: FirehoseCallbacks): FirehoseHandle {
     return openFirehose(this.http, opts, callbacks);
   }

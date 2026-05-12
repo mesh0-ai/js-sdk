@@ -25,20 +25,21 @@ export type {
   MeResponse,
   OrgResponse,
   ProjectResponse,
-  FirehoseMessage,
-  StreamMessage,
+  FirehoseHello,
+  FirehoseEventMeta,
+  FirehoseResync,
+  FirehoseServerError,
+  FirehoseFrame,
 } from "./types.js";
 export type {
   EventsListOpts,
 } from "./resources/events.js";
 export { MAX_EVENTS_PER_REQUEST } from "./resources/events.js";
 export type {
-  StreamCallbacks,
-  StreamHandle,
-} from "./stream/sse.js";
-export type {
+  FirehoseTransport,
   FirehoseOpts,
   FirehoseCallbacks,
-  FirehoseHandle,
+  FirehoseCloseKind,
   FirehoseCloseInfo,
+  FirehoseHandle,
 } from "./stream/firehose.js";

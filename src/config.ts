@@ -34,7 +34,7 @@ export interface Mesh0Config {
 }
 
 const DEFAULT_BASE_URL = "https://api.mesh0.ai";
-const DEFAULT_UA = `mesh0-js-sdk/0.1.0`;
+const DEFAULT_UA = `mesh0-js-sdk/0.2.0`;
 
 function readEnv(name: string): string | undefined {
   // Cross-runtime env access: Node/Bun expose process.env; Deno exposes

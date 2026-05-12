@@ -23,7 +23,8 @@ export interface EventInput {
   data?: Record<string, unknown>;
 }
 
-/** An event row as returned by GET /v1/events and /v1/events/stream. */
+/** An event row as returned by GET /v1/events list endpoints and the
+ *  /v1/firehose stream (both WS and SSE transports). */
 export interface EventRow {
   event_id: string;
   trace_id: string;
@@ -32,7 +33,7 @@ export interface EventRow {
   timestamp: string;
   project_id: string;
   attributes: Record<string, unknown> | null;
-  /** Excluded from /v1/events/stream payloads; present on /v1/events list rows. */
+  /** Excluded from /v1/firehose payloads; present on /v1/events list rows. */
   data?: Record<string, unknown> | null;
 }
 
@@ -110,17 +111,48 @@ export interface ProjectResponse {
   name: string;
 }
 
-/** Server→client message on the WS /v1/firehose stream. Discriminated on `type`. */
-export type FirehoseMessage =
-  | { type: "hello"; topic: string; since: string }
-  | { type: "event"; partition: number; offset: string; row: EventRow }
-  | { type: "ping"; ts: number };
+// ---------- Firehose (org-wide /v1/firehose, WS + SSE transports) ----------
 
-/** Server→client message on the SSE /v1/events/stream channel. Discriminated on
- *  `event` to match the SSE wire format's `event:` field. */
-export type StreamMessage =
-  | { event: "hello"; data: Record<string, unknown> }
-  | { event: "ping"; data: number }
-  | { event: "event"; data: EventRow }
-  | { event: "resync"; data: Record<string, unknown> }
-  | { event: "error"; data: { reason: string; errorId?: string } };
+/** Hello frame shared by both firehose transports. `since` is the
+ *  *effective* start point — the server downgrades a numeric offset to
+ *  `"latest"` on the org-wide firehose, and the hello echoes what was
+ *  actually applied. */
+export interface FirehoseHello {
+  topic: string;
+  since: string;
+  root: boolean;
+}
+
+/** Per-event metadata attached to every row delivered on the firehose. */
+export interface FirehoseEventMeta {
+  partition: number;
+  offset: string;
+}
+
+/** Resync payload. The server emits this when its per-connection queue
+ *  overflowed (slow client) or when an event failed to marshal; the
+ *  stream terminates immediately after delivery on whichever transport
+ *  supports it (SSE today). */
+export interface FirehoseResync {
+  reason: "overflow" | "marshal" | (string & {});
+  /** Best-effort count of events dropped before resync; `0` for
+   *  non-overflow reasons. */
+  dropped: number;
+}
+
+/** Server-sent error payload (SSE `error` frame, or a WS protocol-error
+ *  surface). Terminal — the stream closes immediately after. */
+export interface FirehoseServerError {
+  reason: string;
+  errorId?: string;
+}
+
+/** Transport-agnostic frame shape delivered to `onMessage`. Each native
+ *  WS or SSE frame is normalized into one of these. Discriminated on
+ *  `kind`. */
+export type FirehoseFrame =
+  | { kind: "hello"; hello: FirehoseHello }
+  | { kind: "event"; row: EventRow; meta: FirehoseEventMeta }
+  | { kind: "ping"; ts: number }
+  | { kind: "resync"; info: FirehoseResync }
+  | { kind: "error"; error: FirehoseServerError };

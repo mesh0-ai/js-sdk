@@ -1,185 +1,106 @@
+// Public entrypoint for the org-wide firehose at GET /v1/firehose. The
+// endpoint serves both WebSocket and SSE callers from the same path with
+// identical auth, query params, and payload shape — `opts.transport`
+// picks the wire framing. Both transports converge on the same handle,
+// callbacks, and close semantics so consumers can swap freely.
+
 import type { HttpClient } from "../http.js";
-import { ConfigurationError, NetworkError } from "../errors.js";
-import type { EventRow, FirehoseMessage } from "../types.js";
+import type { NetworkError } from "../errors.js";
+import type {
+  EventRow,
+  FirehoseEventMeta,
+  FirehoseFrame,
+  FirehoseHello,
+  FirehoseResync,
+  FirehoseServerError,
+} from "../types.js";
+import { openSseFirehose } from "./sse.js";
+import { openWsFirehose } from "./ws.js";
+
+export type FirehoseTransport = "ws" | "sse";
 
 export interface FirehoseOpts {
-  /** 'earliest', 'latest', or a numeric offset string. Server default is
-   *  'latest' when omitted. */
+  /** Wire transport. `"ws"` (default) uses the WebSocket upgrade;
+   *  `"sse"` uses Server-Sent Events over plain HTTP — pick SSE for
+   *  callers that can't open a WebSocket (some serverless runtimes,
+   *  proxies that strip Upgrade, EventSource-style consumers). */
+  transport?: FirehoseTransport;
+  /** `"earliest"`, `"latest"`, or a numeric offset string. Server
+   *  default is `"latest"` when omitted. A numeric offset on the
+   *  org-wide firehose is silently downgraded to `"latest"` server-side
+   *  (partitions have independent offset spaces) — the hello frame
+   *  echoes what was actually applied. */
   since?: "earliest" | "latest" | (string & {});
+  /** Server-side filter: when true, only root-trace events (rows with
+   *  empty `parent_span_id`) cross the wire. */
+  root?: boolean;
 }
 
 export interface FirehoseCallbacks {
-  onHello?: (msg: { topic: string; since: string }) => void;
-  onEvent?: (row: EventRow, meta: { partition: number; offset: string }) => void;
+  onHello?: (hello: FirehoseHello) => void;
+  onEvent?: (row: EventRow, meta: FirehoseEventMeta) => void;
   onPing?: (tsMs: number) => void;
-  onMessage?: (msg: FirehoseMessage) => void;
-  /** Surface for transport errors AND malformed server frames. Always a
-   *  NetworkError; subclassing was avoided to keep the contract simple. */
+  /** Terminal on the transports that emit it (SSE today). The stream
+   *  closes immediately after; `closed` resolves with
+   *  `kind: "resync"`. */
+  onResync?: (info: FirehoseResync) => void;
+  /** Transport errors AND malformed/unknown server frames. Always a
+   *  `NetworkError`. Callers that only care about visibility can rely
+   *  on `closed.kind === "error" | "transport"`. */
   onError?: (err: NetworkError) => void;
-  onClose?: (code: number, reason: string) => void;
+  /** Catch-all in receive order. Frames that fail to parse are NOT
+   *  delivered here — those route to `onError`. */
+  onMessage?: (frame: FirehoseFrame) => void;
 }
 
-/** Resolved close state for {@link FirehoseHandle.closed}. `clean` is true
- *  only when the socket closed with a normal-closure code (1000) and no
- *  pending transport error was observed. */
+export type FirehoseCloseKind =
+  /** Stream closed cleanly (WS code 1000 with no prior error, or SSE
+   *  server-EOF / caller-close with no error). */
+  | "ok"
+  /** Server emitted a resync frame and closed the stream. `resync` is
+   *  populated. */
+  | "resync"
+  /** Server emitted an error frame, or WS surfaced an unknown/malformed
+   *  message before close. `error` is populated. */
+  | "error"
+  /** Lower-level transport failure (network drop, HTTP non-2xx connect,
+   *  abnormal WS close). `error` is populated. */
+  | "transport"
+  /** Caller invoked `close()` while the stream was still open. */
+  | "aborted";
+
 export interface FirehoseCloseInfo {
-  code: number;
-  reason: string;
-  clean: boolean;
+  kind: FirehoseCloseKind;
+  /** WS close code when known. Always present for the WS transport;
+   *  absent on SSE. */
+  code?: number;
+  /** WS close reason, or a short tag for SSE close paths. */
+  reason?: string;
+  /** Present when `kind === "resync"`. */
+  resync?: FirehoseResync;
+  /** Present when `kind === "error"` (server-sent error frame). */
+  serverError?: FirehoseServerError;
+  /** Present when `kind === "error" | "transport"`. */
+  error?: NetworkError;
 }
 
 export interface FirehoseHandle {
-  /** Resolves when the socket closes. Inspect `clean`/`code` to detect
-   *  abnormal closure (auth failure surfaces as code 1006/4401, not as a
-   *  rejection — we never reject this promise so `await` is always safe). */
+  /** Resolves when the connection closes, for any reason. Never
+   *  rejects — inspect `kind` to discriminate clean vs failed. */
   closed: Promise<FirehoseCloseInfo>;
+  /** Close the connection. `code` and `reason` are forwarded to the WS
+   *  socket; they are ignored on SSE. */
   close(code?: number, reason?: string): void;
 }
 
-// Minimal structural type so we can accept both browser WebSocket and the
-// `ws` package WebSocket without taking a hard dep on either.
-interface MinimalWebSocket {
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  addEventListener(type: string, listener: (ev: unknown) => void): void;
-}
-
-interface MinimalWebSocketCtor {
-  new (url: string, protocols?: string | string[], options?: unknown): MinimalWebSocket;
-}
-
-/**
- * Open the WebSocket firehose at GET /v1/firehose.
- *
- * Auth is sent via Sec-WebSocket-Protocol on browsers (Authorization
- * headers aren't settable from WebSocket) and the `ws` package's `headers`
- * option on Node when supported.
- */
+/** Open the org-wide firehose at GET /v1/firehose using `opts.transport`
+ *  (default `"ws"`). See {@link FirehoseOpts} and
+ *  {@link FirehoseCallbacks} for the shared contract. */
 export function openFirehose(
   http: HttpClient,
   opts: FirehoseOpts = {},
   callbacks: FirehoseCallbacks = {},
 ): FirehoseHandle {
-  const cfg = http.config;
-  const WS = cfg.WebSocket as unknown as MinimalWebSocketCtor | undefined;
-  if (!WS) {
-    throw new ConfigurationError(
-      "mesh0: no WebSocket implementation available — on Node <22, install the `ws` package and pass it via Mesh0({ WebSocket: WebSocket })",
-    );
-  }
-
-  const wsUrl = http
-    .buildUrl("/v1/firehose", opts.since ? { since: opts.since } : undefined)
-    .replace(/^http(s?):/, (_m, s: string) => `ws${s}:`);
-
-  // Subprotocol token works for both browser and `ws` package — the server
-  // accepts `mesh0.token.<key>` on Sec-WebSocket-Protocol. We still pass a
-  // Bearer header through the `ws` `headers` option when it's available
-  // (no-op in browsers) so non-browser clients work even if a future
-  // server rejects subprotocol auth.
-  const tokenProto = `mesh0.token.${cfg.apiKey}`;
-  let sock: MinimalWebSocket;
-  try {
-    sock = new WS(wsUrl, [tokenProto], {
-      // The `ws` Node package reads this; browsers ignore it.
-      headers: {
-        Authorization: `Bearer ${cfg.apiKey}`,
-        "User-Agent": cfg.userAgent,
-      },
-    });
-  } catch (err) {
-    throw new NetworkError("mesh0: firehose connect failed", err);
-  }
-
-  let closeResolve: (v: FirehoseCloseInfo) => void = () => {};
-  const closed = new Promise<FirehoseCloseInfo>((res) => {
-    closeResolve = res;
-  });
-  let sawError = false;
-
-  sock.addEventListener("message", (ev: unknown) => {
-    const data = extractData(ev);
-    if (data === null) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data);
-    } catch (err) {
-      sawError = true;
-      callbacks.onError?.(new NetworkError("mesh0: firehose received malformed JSON frame", err));
-      return;
-    }
-    if (!parsed || typeof parsed !== "object") {
-      sawError = true;
-      callbacks.onError?.(new NetworkError("mesh0: firehose received non-object frame"));
-      return;
-    }
-    const msg = parsed as FirehoseMessage;
-    callbacks.onMessage?.(msg);
-    switch (msg.type) {
-      case "hello":
-        callbacks.onHello?.({ topic: msg.topic, since: msg.since });
-        break;
-      case "event":
-        callbacks.onEvent?.(msg.row, { partition: msg.partition, offset: msg.offset });
-        break;
-      case "ping":
-        callbacks.onPing?.(msg.ts);
-        break;
-      default:
-        // Unknown message types are a protocol-version mismatch — surface
-        // them so consumers can update the SDK or report upstream.
-        sawError = true;
-        callbacks.onError?.(
-          new NetworkError(`mesh0: firehose received unknown message type ${JSON.stringify((msg as { type?: unknown }).type)}`),
-        );
-    }
-  });
-  sock.addEventListener("error", (ev: unknown) => {
-    sawError = true;
-    callbacks.onError?.(toNetworkError(ev));
-  });
-  sock.addEventListener("close", (ev: unknown) => {
-    const rawCode =
-      ev && typeof ev === "object" && "code" in ev
-        ? Number((ev as { code: unknown }).code)
-        : NaN;
-    const code = Number.isFinite(rawCode) ? rawCode : 1000;
-    const reason =
-      ev && typeof ev === "object" && "reason" in ev
-        ? String((ev as { reason: unknown }).reason ?? "")
-        : "";
-    const clean = !sawError && code === 1000;
-    callbacks.onClose?.(code, reason);
-    closeResolve({ code, reason, clean });
-  });
-
-  return {
-    closed,
-    close: (code = 1000, reason = "") => sock.close(code, reason),
-  };
-}
-
-function toNetworkError(ev: unknown): NetworkError {
-  if (ev && typeof ev === "object") {
-    // Browser ErrorEvent carries `.error` (the underlying Error) and `.message`.
-    // The `ws` package emits an Error directly.
-    const obj = ev as { message?: unknown; error?: unknown };
-    const msg = typeof obj.message === "string" ? obj.message : "mesh0: firehose socket error";
-    const cause = obj.error ?? ev;
-    return new NetworkError(msg, cause);
-  }
-  return new NetworkError("mesh0: firehose socket error");
-}
-
-function extractData(ev: unknown): string | null {
-  if (!ev || typeof ev !== "object") return null;
-  const d = (ev as { data?: unknown }).data;
-  if (typeof d === "string") return d;
-  // Node `ws` may emit Buffer; browsers emit Blob/ArrayBuffer when binaryType
-  // is set. Coerce the binary forms we can without pulling in Node's Buffer
-  // typings, but ignore unknown shapes so we never feed `[object Object]`
-  // into JSON.parse.
-  if (d instanceof Uint8Array) return new TextDecoder("utf-8").decode(d);
-  if (d instanceof ArrayBuffer) return new TextDecoder("utf-8").decode(new Uint8Array(d));
-  return null;
+  if (opts.transport === "sse") return openSseFirehose(http, opts, callbacks);
+  return openWsFirehose(http, opts, callbacks);
 }

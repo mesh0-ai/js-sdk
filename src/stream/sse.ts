@@ -1,11 +1,15 @@
-// fetch-based SSE parser. EventSource is not portable across runtimes
-// (browsers + Node 22+ have it, edge runtimes vary, and EventSource can't
-// set the Authorization header in browsers). Doing it ourselves with
-// fetch + ReadableStream keeps one code path everywhere.
+// fetch-based SSE parser for the SSE transport of the org-wide firehose
+// (GET /v1/firehose without an Upgrade header). EventSource is not
+// portable across runtimes (browsers + Node 22+ have it, edge runtimes
+// vary, and EventSource can't set Authorization in browsers). Doing the
+// parse ourselves with fetch + ReadableStream keeps one code path
+// everywhere.
 //
-// Note: this client does not auto-reconnect. Consumers wanting at-least-
-// once delivery across reconnects should track the latest event_id they
-// saw and re-call stream() after `done` resolves or rejects.
+// Note: this client does not auto-reconnect. After a `resync` (server-
+// side queue overflow or marshal failure) or an `error` frame, the
+// stream terminates and `closed` resolves with the corresponding
+// `kind`. Consumers should re-call `openFirehose()` and refetch from
+// /v1/events to recover dropped rows.
 
 import type { HttpClient } from "../http.js";
 import {
@@ -18,25 +22,18 @@ import {
   RateLimitError,
   ServerError,
 } from "../errors.js";
-import type { EventRow, StreamMessage } from "../types.js";
-
-export interface StreamHandle {
-  /** Resolves when the stream ends cleanly (server closes or caller calls
-   *  `close()`). Rejects on transport error or a server-sent `error` frame. */
-  done: Promise<void>;
-  /** Close the underlying connection. */
-  close(): void;
-}
-
-export interface StreamCallbacks {
-  onEvent?: (row: EventRow) => void;
-  onHello?: (data: Record<string, unknown>) => void;
-  onPing?: (tsMs: number) => void;
-  onResync?: () => void;
-  onError?: (err: { reason: string; errorId?: string }) => void;
-  /** Catch-all: every server-sent message, in receive order. */
-  onMessage?: (msg: StreamMessage) => void;
-}
+import type {
+  EventRow,
+  FirehoseFrame,
+  FirehoseResync,
+  FirehoseServerError,
+} from "../types.js";
+import type {
+  FirehoseCallbacks,
+  FirehoseCloseInfo,
+  FirehoseHandle,
+  FirehoseOpts,
+} from "./firehose.js";
 
 interface RawSse {
   event: string;
@@ -44,77 +41,131 @@ interface RawSse {
 }
 
 function* parseSseBuffer(buf: string): Generator<RawSse> {
-  // The wire spec is "\n\n" separated records; we accept "\r\n\r\n" too.
-  const normalized = buf.replace(/\r\n/g, "\n");
-  for (const block of normalized.split("\n\n")) {
+  // The wire spec is "\n\n" separated records; CRLF is normalized before
+  // we reach this function.
+  for (const block of buf.split("\n\n")) {
     if (!block) continue;
     let event = "message";
     const dataLines: string[] = [];
+    let sawField = false;
     for (const line of block.split("\n")) {
       if (!line || line.startsWith(":")) continue;
       const colon = line.indexOf(":");
-      if (colon === -1) continue;
-      const field = line.slice(0, colon);
-      let value = line.slice(colon + 1);
+      // WHATWG spec: a line with no colon is treated as a field whose
+      // value is the empty string. We honor that for `data` (rare but
+      // forward-compatible).
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
       if (value.startsWith(" ")) value = value.slice(1);
+      sawField = true;
       if (field === "event") event = value;
       else if (field === "data") dataLines.push(value);
     }
-    yield { event, data: dataLines.join("\n") };
+    if (sawField) yield { event, data: dataLines.join("\n") };
   }
 }
 
-function parseSseData(event: string, data: string): StreamMessage | null {
+type ParseResult =
+  | { ok: true; frame: FirehoseFrame }
+  | { ok: false; error: NetworkError };
+
+function parseSseData(event: string, data: string): ParseResult | null {
   switch (event) {
     case "hello": {
       const parsed = data ? safeJson(data) : {};
-      return { event: "hello", data: (parsed as Record<string, unknown>) ?? {} };
+      if (parsed === SAFE_JSON_FAIL) return parseFail("hello", data);
+      const obj = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+      return {
+        ok: true,
+        frame: {
+          kind: "hello",
+          hello: {
+            topic: typeof obj.topic === "string" ? obj.topic : "",
+            since: typeof obj.since === "string" ? obj.since : "",
+            root: typeof obj.root === "boolean" ? obj.root : false,
+          },
+        },
+      };
     }
     case "ping": {
-      // Server may send either a bare number or `{"ts": <number>}`. We
-      // accept both; the firehose ping uses the object form so this
-      // keeps consumers consistent across the two channels.
+      // Server may send a bare epoch-ms number or `{"ts": <number>}`. An
+      // empty `data:` is malformed — treat as an error frame so it
+      // surfaces instead of firing `onPing(0)`.
       const trimmed = data.trim();
+      if (trimmed === "") return parseFail("ping", data);
       const asNum = Number(trimmed);
-      if (Number.isFinite(asNum)) return { event: "ping", data: asNum };
+      if (Number.isFinite(asNum)) return { ok: true, frame: { kind: "ping", ts: asNum } };
       const parsed = safeJson(trimmed);
+      if (parsed === SAFE_JSON_FAIL) return parseFail("ping", data);
       if (parsed && typeof parsed === "object") {
         const ts = (parsed as { ts?: unknown }).ts;
         if (typeof ts === "number" && Number.isFinite(ts)) {
-          return { event: "ping", data: ts };
+          return { ok: true, frame: { kind: "ping", ts } };
         }
       }
-      return null;
+      return parseFail("ping", data);
     }
     case "event": {
       const parsed = safeJson(data);
-      if (!parsed || typeof parsed !== "object") return null;
-      return { event: "event", data: parsed as EventRow };
+      if (parsed === SAFE_JSON_FAIL) return parseFail("event", data);
+      if (!parsed || typeof parsed !== "object") return parseFail("event", data);
+      const obj = parsed as { partition?: unknown; offset?: unknown; row?: unknown };
+      if (!obj.row || typeof obj.row !== "object") return parseFail("event", data);
+      if (typeof obj.partition !== "number") return parseFail("event", data);
+      if (typeof obj.offset !== "string") return parseFail("event", data);
+      return {
+        ok: true,
+        frame: {
+          kind: "event",
+          row: obj.row as EventRow,
+          meta: { partition: obj.partition, offset: obj.offset },
+        },
+      };
     }
-    case "resync":
-      return { event: "resync", data: {} };
+    case "resync": {
+      const parsed = safeJson(data);
+      if (parsed === SAFE_JSON_FAIL) return parseFail("resync", data);
+      const body = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+      const info: FirehoseResync = {
+        reason: typeof body.reason === "string" ? body.reason : "unknown",
+        dropped: typeof body.dropped === "number" ? body.dropped : 0,
+      };
+      return { ok: true, frame: { kind: "resync", info } };
+    }
     case "error": {
       const parsed = safeJson(data);
+      if (parsed === SAFE_JSON_FAIL) return parseFail("error", data);
       const body = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
-      const reason = typeof body.reason === "string" ? body.reason : "unknown";
-      const out: { event: "error"; data: { reason: string; errorId?: string } } = {
-        event: "error",
-        data: { reason },
+      const error: FirehoseServerError = {
+        reason: typeof body.reason === "string" ? body.reason : "unknown",
       };
-      if (typeof body.errorId === "string") out.data.errorId = body.errorId;
-      return out;
+      if (typeof body.errorId === "string") error.errorId = body.errorId;
+      return { ok: true, frame: { kind: "error", error } };
     }
     default:
-      return null;
+      return {
+        ok: false,
+        error: new NetworkError(`mesh0: SSE received unknown event type "${event}"`),
+      };
   }
 }
+
+const SAFE_JSON_FAIL = Symbol("safeJsonFail");
 
 function safeJson(s: string): unknown {
   try {
     return JSON.parse(s);
   } catch {
-    return null;
+    return SAFE_JSON_FAIL;
   }
+}
+
+function parseFail(event: string, data: string): ParseResult {
+  const sample = data.length > 120 ? `${data.slice(0, 117)}...` : data;
+  return {
+    ok: false,
+    error: new NetworkError(`mesh0: SSE received malformed "${event}" frame: ${sample}`),
+  };
 }
 
 function isAbortError(err: unknown): boolean {
@@ -128,7 +179,7 @@ async function buildConnectError(res: Response): Promise<Mesh0Error> {
     try {
       json = JSON.parse(raw);
     } catch {
-      /* leave as raw string */
+      /* leave json = null; we'll attach the raw text to the error body */
     }
   }
   const j = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
@@ -136,25 +187,37 @@ async function buildConnectError(res: Response): Promise<Mesh0Error> {
   const reason = typeof j.reason === "string" ? `: ${j.reason}` : "";
   const message = `mesh0: SSE connect failed — ${res.status} ${code}${reason}`;
   const errorId = typeof j.errorId === "string" ? j.errorId : undefined;
+  // Always carry something on `.body` so consumers can inspect non-JSON
+  // (HTML proxy responses, plain text) instead of losing it.
+  const body: unknown = json ?? (raw ? { raw } : null);
   if (res.status === 401 || res.status === 403)
-    return new AuthenticationError(res.status, code, message, json);
-  if (res.status === 404) return new NotFoundError(res.status, code, message, json);
-  if (res.status === 429)
-    return new RateLimitError(res.status, code, message, json);
-  if (res.status >= 500)
-    return new ServerError(res.status, code, message, json, errorId);
-  if (res.status >= 400)
-    return new BadRequestError(res.status, code, message, json);
-  return new ApiError(res.status, code, message, json);
+    return new AuthenticationError(res.status, code, message, body);
+  if (res.status === 404) return new NotFoundError(res.status, code, message, body);
+  if (res.status === 429) return new RateLimitError(res.status, code, message, body);
+  if (res.status >= 500) return new ServerError(res.status, code, message, body, errorId);
+  if (res.status >= 400) return new BadRequestError(res.status, code, message, body);
+  return new ApiError(res.status, code, message, body);
 }
 
-/** Open the SSE channel at GET /v1/events/stream. */
-export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}): StreamHandle {
+export function openSseFirehose(
+  http: HttpClient,
+  opts: FirehoseOpts,
+  callbacks: FirehoseCallbacks,
+): FirehoseHandle {
   const ac = new AbortController();
-  const url = http.buildUrl("/v1/events/stream");
+  const query: Record<string, string | number | boolean> = {};
+  if (opts.since) query.since = opts.since;
+  if (opts.root) query.root = 1;
+  const url = http.buildUrl("/v1/firehose", Object.keys(query).length ? query : undefined);
   const cfg = http.config;
 
-  const done = (async () => {
+  let userClosed = false;
+  let pending: FirehoseCloseInfo | null = null;
+  const setPending = (info: FirehoseCloseInfo): void => {
+    if (!pending) pending = info;
+  };
+
+  const closed: Promise<FirehoseCloseInfo> = (async () => {
     let res: Response;
     try {
       res = await cfg.fetch(url, {
@@ -168,73 +231,109 @@ export function streamEvents(http: HttpClient, callbacks: StreamCallbacks = {}):
         signal: ac.signal,
       });
     } catch (err) {
-      if (isAbortError(err)) return;
-      throw new NetworkError("mesh0: SSE connect failed", err);
+      if (isAbortError(err)) {
+        return pending ?? { kind: "aborted" };
+      }
+      const wrapped = new NetworkError("mesh0: SSE connect failed", err);
+      callbacks.onError?.(wrapped);
+      return { kind: "transport", error: wrapped };
     }
-    if (!res.ok) throw await buildConnectError(res);
-    if (!res.body) throw new NetworkError("mesh0: SSE response had no body");
+    if (!res.ok) {
+      const err = await buildConnectError(res);
+      const wrapped = err instanceof NetworkError ? err : new NetworkError(err.message, err);
+      callbacks.onError?.(wrapped);
+      return { kind: "transport", error: wrapped };
+    }
+    if (!res.body) {
+      const err = new NetworkError("mesh0: SSE response had no body");
+      callbacks.onError?.(err);
+      return { kind: "transport", error: err };
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
-    let serverError: { reason: string; errorId?: string } | null = null;
+    // A trailing "\r" at a chunk boundary may pair with a "\n" at the
+    // start of the next chunk. Stash it so the CRLF normalization
+    // doesn't miss the seam.
+    let pendingCR = false;
     try {
-      for (;;) {
+      readLoop: for (;;) {
         const { value, done: streamDone } = await reader.read();
         if (streamDone) break;
-        // Normalize CRLF up-front so boundary indices line up with the
-        // string we actually slice. The SSE spec mandates LF after
-        // normalization anyway.
-        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let chunk = decoder.decode(value, { stream: true });
+        if (pendingCR) {
+          chunk = "\r" + chunk;
+          pendingCR = false;
+        }
+        if (chunk.endsWith("\r")) {
+          chunk = chunk.slice(0, -1);
+          pendingCR = true;
+        }
+        buf += chunk.replace(/\r\n/g, "\n");
         const lastBreak = buf.lastIndexOf("\n\n");
         if (lastBreak === -1) continue;
         const complete = buf.slice(0, lastBreak + 2);
         buf = buf.slice(lastBreak + 2);
         for (const raw of parseSseBuffer(complete)) {
-          const msg = parseSseData(raw.event, raw.data);
-          if (!msg) continue;
-          callbacks.onMessage?.(msg);
-          switch (msg.event) {
+          const result = parseSseData(raw.event, raw.data);
+          if (!result) continue;
+          if (!result.ok) {
+            callbacks.onError?.(result.error);
+            // Malformed frames are advisory, not terminal — keep reading.
+            continue;
+          }
+          const frame = result.frame;
+          callbacks.onMessage?.(frame);
+          switch (frame.kind) {
             case "hello":
-              callbacks.onHello?.(msg.data);
+              callbacks.onHello?.(frame.hello);
               break;
             case "ping":
-              callbacks.onPing?.(msg.data);
+              callbacks.onPing?.(frame.ts);
               break;
             case "event":
-              callbacks.onEvent?.(msg.data);
+              callbacks.onEvent?.(frame.row, frame.meta);
               break;
             case "resync":
-              callbacks.onResync?.();
-              break;
+              callbacks.onResync?.(frame.info);
+              setPending({ kind: "resync", resync: frame.info });
+              // Terminal — stop dispatching further frames immediately.
+              ac.abort();
+              break readLoop;
             case "error":
-              callbacks.onError?.(msg.data);
-              // Capture and reject `done` once the stream closes — a server
-              // `error` frame is a terminal condition, never recoverable.
-              serverError = msg.data;
-              break;
+              setPending({ kind: "error", serverError: frame.error });
+              ac.abort();
+              break readLoop;
           }
         }
       }
     } catch (err) {
-      if (isAbortError(err)) return;
-      throw err;
+      if (isAbortError(err)) {
+        // Either the caller closed us, or we aborted ourselves after a
+        // terminal frame. Either way, `pending` is authoritative.
+        return pending ?? (userClosed ? { kind: "aborted" } : { kind: "ok" });
+      }
+      const wrapped = err instanceof NetworkError ? err : new NetworkError("mesh0: SSE stream failed", err);
+      callbacks.onError?.(wrapped);
+      return { kind: "transport", error: wrapped };
     } finally {
-      // Lock may already be released if the stream closed naturally.
       try {
         reader.releaseLock();
       } catch {
-        /* ignore */
+        /* lock may already be released after natural EOF or abort */
       }
     }
-    if (serverError) {
-      const detail = serverError.errorId ? ` (errorId=${serverError.errorId})` : "";
-      throw new NetworkError(`mesh0: SSE server error — ${serverError.reason}${detail}`);
-    }
+    if (pending) return pending;
+    if (userClosed) return { kind: "aborted" };
+    return { kind: "ok" };
   })();
 
   return {
-    done,
-    close: () => ac.abort(),
+    closed,
+    close: () => {
+      userClosed = true;
+      ac.abort();
+    },
   };
 }
