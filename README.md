@@ -253,7 +253,7 @@ const mesh0 = new Mesh0({
 
 | Env var          | Description                                          |
 | ---------------- | ---------------------------------------------------- |
-| `MESH0_API_KEY`  | API key (`m0_<routing>_<secret>`). **Required.**     |
+| `MESH0_API_KEY`  | Credential. **Required.** A project key (`m0_<routing>_<secret>`), a user key (`m0u_<secret>`), or an open-mode instance token (JWT). |
 | `MESH0_BASE_URL` | Override base URL (self-hosted deployments).         |
 
 ---

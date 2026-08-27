@@ -4,6 +4,38 @@ All notable changes to `@mesh0/sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [SemVer](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- **Accept open-mode instance tokens as a credential.** `resolveConfig`
+  rejected any `apiKey` not starting with `m0_`, throwing
+  `ConfigurationError` before any network call. mesh0's admission layer
+  routes a non-`m0_` bearer to open mode, where a workspace-scoped instance
+  token (a JWT) is the ONLY credential in existence — it authenticates
+  ingest, the firehose, the management API and `/mcp` alike. The prefix check
+  therefore made every one of those unreachable from this SDK for a cluster
+  running open mode.
+
+  Observed in production as a firehose that never connected: the consumer
+  held a valid instance token, and `new Mesh0({ apiKey })` threw
+  client-side on construction, so the reconnect loop retried a
+  `ConfigurationError` every 30s indefinitely — no request was ever made and
+  nothing server-side could report why.
+
+  `m0u_` user keys are now accepted for the same reason: they were already a
+  documented credential shape that this check refused.
+
+  The instance-token arm is a SHAPE test, not a validation: three unpadded
+  base64url segments whose first decodes to a JOSE header object carrying
+  `alg`. Signature, claims and expiry are the server's business and it holds
+  the key. Decoding the header is what makes it narrow enough to be worth
+  having — segment-counting alone accepts `api.mesh0.ai`, which is exactly
+  the kind of mistake the check exists to catch. Exposed as `isInstanceToken`
+  for callers that need to tell the shapes apart.
+
+  Mirrors `mesh0/php-sdk`, which made the same change in its 1.4.0.
+
 ## 0.2.0 — unreleased
 
 This release tracks the server-side unification of the realtime API:
