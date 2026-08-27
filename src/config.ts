@@ -49,11 +49,73 @@ function readEnv(name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Does this credential have the shape of an open-mode instance token?
+ *
+ * Three unpadded base64url segments whose first decodes to a JOSE header
+ * object carrying `alg`. Deliberately says nothing about the signature, the
+ * claims, or whether the token is expired — all three are the server's to
+ * judge, and it is the only party holding the key.
+ *
+ * Decoding the header is what makes the check narrow enough to be worth
+ * having. Segment-counting alone accepts `api.mesh0.ai`, which is three
+ * dot-separated alphanumeric runs and exactly the kind of mistake this
+ * exists to catch. mesh0 requires UNPADDED base64url on the wire, so `=` is
+ * deliberately outside the character class.
+ */
+export function isInstanceToken(candidate: string): boolean {
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(candidate)) {
+    return false;
+  }
+  const header = candidate.slice(0, candidate.indexOf("."));
+  let decoded: string;
+  try {
+    decoded = decodeBase64Url(header);
+  } catch {
+    return false;
+  }
+  if (decoded === "") return false;
+  try {
+    const parsed: unknown = JSON.parse(decoded);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) && "alg" in parsed;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decode unpadded base64url across runtimes. `atob` is the one decoder
+ * present in browsers, Deno, Bun and Node 16+ alike; Buffer is not.
+ */
+function decodeBase64Url(segment: string): string {
+  const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  const g = globalThis as unknown as { atob?: (data: string) => string };
+  if (typeof g.atob !== "function") {
+    throw new Error("no base64 decoder available");
+  }
+  return g.atob(padded);
+}
+
+/**
+ * The credential shapes this SDK forwards as a bearer.
+ *
+ * `m0_` project keys and `m0u_` user keys are the classic pair. An open-mode
+ * instance token is a third: mesh0's admission layer routes a non-`m0_`
+ * bearer to open mode, where that JWT is the ONLY credential a workspace has
+ * — it authenticates ingest, the firehose, the management API and `/mcp`
+ * alike. Rejecting it here made every one of those unreachable from this SDK
+ * for a cluster running open mode.
+ */
+function isAcceptedCredential(apiKey: string): boolean {
+  return apiKey.startsWith("m0_") || apiKey.startsWith("m0u_") || isInstanceToken(apiKey);
+}
+
 export function resolveConfig(input: Mesh0ConfigInput = {}): Mesh0Config {
   const apiKey = input.apiKey ?? readEnv("MESH0_API_KEY");
-  if (!apiKey || !apiKey.startsWith("m0_")) {
+  if (!apiKey || !isAcceptedCredential(apiKey)) {
     throw new ConfigurationError(
-      "mesh0: apiKey is required and must start with 'm0_' (set MESH0_API_KEY or pass { apiKey }).",
+      "mesh0: apiKey is required and must start with 'm0_' or 'm0u_', or be a JWT instance token (set MESH0_API_KEY or pass { apiKey }).",
     );
   }
   const baseUrl = (input.baseUrl ?? readEnv("MESH0_BASE_URL") ?? DEFAULT_BASE_URL).replace(
