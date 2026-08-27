@@ -4,7 +4,7 @@ All notable changes to `@mesh0/sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [SemVer](https://semver.org/).
 
-## Unreleased
+## 0.2.1
 
 ### Fixed
 
@@ -36,7 +36,7 @@ this project adheres to [SemVer](https://semver.org/).
 
   Mirrors `mesh0/php-sdk`, which made the same change in its 1.4.0.
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-05-12
 
 This release tracks the server-side unification of the realtime API:
 the per-project SSE endpoint `/v1/events/stream` has been folded into

@@ -1,6 +1,6 @@
 {
   "name": "@mesh0/sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Official JavaScript/TypeScript client for the mesh0 telemetry platform — send events, query with TQL, tail with SSE/WebSocket.",
   "license": "MIT",
   "author": "mesh0",
